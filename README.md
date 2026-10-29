@@ -1,4 +1,5 @@
-#  ATS RESUME CHECKER
+# 📄 ATS Resume Checker
+
 A Streamlit app that scores how ATS-friendly a resume is and suggests concrete improvements. Upload a resume (PDF, DOCX or TXT), optionally paste a job description, and get:
 
 - An overall **ATS score** (0-100) and a breakdown by category
@@ -8,7 +9,7 @@ A Streamlit app that scores how ATS-friendly a resume is and suggests concrete i
 - Quick rule-based checks (email, phone, sections, length)
 - A downloadable JSON report
 
-Built with [Streamlit](https://streamlit.io) and [Groq](https://groq.com) (default model: `llama-3.3-70b-versatile`).
+Built with [Streamlit](https://streamlit.io) and [Groq](https://groq.com) (default model: `openai/gpt-oss-120b`).
 
 ## Project structure
 
@@ -64,12 +65,13 @@ To change the key later: open your app → **⋮ / Manage app → Settings → S
 | `GROQ_API_KEY` | Streamlit secrets or environment variable | Your Groq API key |
 | `GROQ_MODEL` | Environment variable (optional) | Adds another model name to the sidebar dropdown |
 
-The sidebar model list can be edited via `MODEL_CHOICES` in `app.py`. Groq's catalogue changes over time, so check <https://console.groq.com/docs/models> if a model stops working.
+The sidebar lists the chat models your Groq key can see, with `openai/gpt-oss-120b` and `openai/gpt-oss-20b` first. If the chosen model is unavailable for your account, the app automatically tries the next one and tells you which was used. Edit `PREFERRED_MODELS` in `app.py` to change the order. Groq's catalogue changes over time - see <https://console.groq.com/docs/models>.
 
 ## Troubleshooting
 
 - **"Very little text could be extracted"** – the resume is probably a scanned image. Export a text-based PDF or DOCX instead (an ATS can't read images either).
 - **"This PDF is password protected"** – upload an unlocked copy.
+- **`model_not_found` / 404** – some Groq models (e.g. the Llama ones) are Enterprise-only. The app falls back automatically; you can also pick `openai/gpt-oss-120b` in the sidebar.
 - **Analysis failed / rate limit errors** – Groq's free tier has per-minute and per-day limits; wait a bit and retry.
 - **Old `.doc` files** – not supported; save as `.docx` or PDF.
 
