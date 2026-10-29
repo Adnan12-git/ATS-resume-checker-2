@@ -1,5 +1,3 @@
-# 📄 ATS Resume Checker
-
 A Streamlit app that scores how ATS-friendly a resume is and suggests concrete improvements. Upload a resume (PDF, DOCX or TXT), optionally paste a job description, and get:
 
 - An overall **ATS score** (0-100) and a breakdown by category
