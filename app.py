@@ -19,8 +19,18 @@ from pypdf import PdfReader
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
-MODEL_CHOICES = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+# Models are tried in this order. Some Groq models (e.g. the Llama ones) are
+# "Enterprise" only, so a normal key gets a 404 for them - the app then falls
+# back to the next model automatically. Check https://console.groq.com/docs/models
+PREFERRED_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+NON_CHAT_HINTS = ("whisper", "guard", "orpheus", "tts", "safeguard", "embed")
+APP_VERSION = "2.1 (model fallback)"
+MAX_OUTPUT_TOKENS = 6000  # reasoning models spend part of this on "thinking"
 MAX_RESUME_CHARS = 12000  # keeps the prompt well inside the model context
 MAX_JD_CHARS = 6000
 MIN_TEXT_CHARS = 100  # below this the file is probably a scanned image
@@ -252,33 +262,96 @@ def normalise_result(data: dict) -> dict:
     }
 
 
-def analyse_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
+def is_model_unavailable(exc: Exception) -> bool:
+    """True when Groq says the model doesn't exist or this key can't use it."""
+    text = str(exc).lower()
+    return (
+        "model_not_found" in text
+        or "does not exist" in text
+        or "decommissioned" in text
+        or getattr(exc, "status_code", None) == 404
+    )
+
+
+def _call_model(client, model: str, messages: list) -> str:
+    """One chat completion. Retries with simpler settings if a parameter is rejected."""
+    base = dict(model=model, messages=messages, temperature=0.2, max_tokens=MAX_OUTPUT_TOKENS)
+    attempts = []
+    full = dict(base, response_format={"type": "json_object"})
+    if "gpt-oss" in model:
+        full["extra_body"] = {"reasoning_effort": "low"}  # faster, leaves room for the answer
+    attempts.append(full)
+    attempts.append(dict(base, response_format={"type": "json_object"}))
+    attempts.append(base)
+
+    last_exc = None
+    for kwargs in attempts:
+        try:
+            response = client.chat.completions.create(**kwargs)
+            return response.choices[0].message.content or ""
+        except Exception as exc:  # noqa: BLE001
+            if is_model_unavailable(exc):
+                raise  # no point retrying other settings for this model
+            last_exc = exc
+    raise last_exc
+
+
+def candidate_models(selected: str) -> list:
+    """Selected model first, then the preferred list as fallbacks."""
+    order = [selected] + [m for m in PREFERRED_MODELS if m != selected]
+    return [m for m in order if m]
+
+
+def analyse_resume(api_key: str, model: str, resume_text: str, job_description: str, extra_models=None):
+    """Return (result_dict, model_used). Falls back to other models on 404.
+
+    extra_models: other model ids (e.g. the ones your key can list) to try last.
+    """
     client = Groq(api_key=api_key)
-    prompt = build_prompt(resume_text, job_description)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
+        {"role": "user", "content": build_prompt(resume_text, job_description)},
     ]
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=2500,
-            response_format={"type": "json_object"},
-        )
-    except Exception:
-        # Some models do not support JSON mode - retry without it.
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=2500,
-        )
+    last_exc = None
+    candidates = candidate_models(model)
+    for extra in extra_models or []:
+        if extra not in candidates:
+            candidates.append(extra)
+    candidates = candidates[:8]  # don't loop forever
 
-    raw = response.choices[0].message.content or ""
-    return normalise_result(parse_json_response(raw))
+    for candidate in candidates:
+        try:
+            raw = _call_model(client, candidate, messages)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if is_model_unavailable(exc):
+                continue  # try the next model
+            raise
+        if not raw.strip():
+            raise ValueError(
+                "The model returned an empty answer. Try again or pick another model."
+            )
+        return normalise_result(parse_json_response(raw)), candidate
+
+    raise RuntimeError(
+        f"None of the {len(candidates)} models I tried are available for your Groq API key "
+        f"({', '.join(candidates)}). Open console.groq.com/docs/models and check which "
+        f"models your account can use. Last error: {last_exc}"
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def list_chat_models(api_key: str) -> list:
+    """Ask Groq which models exist, keep chat models, put preferred ones first."""
+    try:
+        ids = [m.id for m in Groq(api_key=api_key).models.list().data]
+    except Exception:  # noqa: BLE001
+        return []
+    ids = [i for i in ids if not any(h in i.lower() for h in NON_CHAT_HINTS)]
+    first = [m for m in PREFERRED_MODELS if m in ids]
+    rest = sorted(i for i in ids if i not in first)
+    return first + rest
 
 
 # ----------------------------------------------------------------------------
@@ -373,12 +446,23 @@ def main() -> None:
         else:
             st.success("Groq API key loaded.")
 
+        listed = list_chat_models(api_key) if api_key else []
+        choices = listed or PREFERRED_MODELS.copy()
+        if api_key and not listed:
+            st.warning("Could not fetch the model list from Groq. Check that your API key is valid.")
         env_model = os.environ.get("GROQ_MODEL", "")
-        choices = MODEL_CHOICES.copy()
-        if env_model and env_model not in choices:
-            choices.insert(0, env_model)
-        model = st.selectbox("Model", choices, index=0)
+        if env_model:
+            choices = [env_model] + [c for c in choices if c != env_model]
+        model = st.selectbox(
+            "Model",
+            choices,
+            index=0,
+            help="If a model isn't available for your key, the app tries the next one automatically.",
+        )
+        if listed:
+            st.caption(f"{len(listed)} chat models visible to your key.")
         st.markdown("---")
+        st.caption(f"App version {APP_VERSION}")
         st.caption("Your resume is sent to Groq for analysis and is not stored by this app.")
 
     uploaded = st.file_uploader("Upload your resume", type=["pdf", "docx", "txt"])
@@ -409,11 +493,15 @@ def main() -> None:
 
         with st.spinner("Analysing your resume..."):
             try:
-                result = analyse_resume(api_key, model, resume_text, job_description)
+                result, used_model = analyse_resume(
+                    api_key, model, resume_text, job_description, extra_models=listed
+                )
             except Exception as exc:
                 st.error(f"Analysis failed: {exc}")
                 return
 
+        if used_model != model:
+            st.info(f"`{model}` is not available for your key, so `{used_model}` was used instead.")
         render_results(result, resume_text)
 
 
